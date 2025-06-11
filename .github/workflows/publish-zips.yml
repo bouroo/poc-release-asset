@@ -23,7 +23,7 @@ jobs:
       - name: Install ORAS CLI
         # ORAS (OCI Registry As Storage) is a CLI tool to interact with OCI registries
         # It's ideal for pushing arbitrary artifacts (like zips) to ghcr.io
-        uses: oras-project/setup-oras@v1
+        uses: oras-project/setup-oras@v1 # <--- CHANGED THIS LINE
         with:
           version: 1.0.0 # Use a specific version for stability
 
@@ -32,9 +32,7 @@ jobs:
 
       - name: Create and Publish Zips for each project
         env:
-          # GITHUB_TOKEN is a secret token automatically provided by GitHub Actions
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # The tag name (e.g., v1.0.0)
           TAG_NAME: ${{ github.ref_name }}
         run: |
           PROJECTS_DIR="./projects"
@@ -54,25 +52,39 @@ jobs:
           # Loop through each subdirectory in the projects directory
           for project_path in "$PROJECTS_DIR"/*/; do
             if [ -d "$project_path" ]; then
-              project_name=$(basename "$project_path") # Get the name of the project directory
-              zip_file_name="${project_name}.zip"      # Define the name for the zip file
+              project_name_raw=$(basename "$project_path") # Get the original name of the project directory
+
+              # --- SANITIZE PROJECT NAME FOR OCI ARTIFACT NAMING ---
+              # 1. Convert to lowercase
+              # 2. Replace spaces/underscores with hyphens
+              # 3. Remove any characters that are not alphanumeric or hyphens
+              # 4. Remove leading/trailing hyphens
+              # 5. Collapse multiple hyphens into a single hyphen
+              project_name=$(echo "$project_name_raw" | tr '[:upper:]' '[:lower:]' | sed 's/[ _]/-/g' | sed 's/[^a-z0-9-]//g')
+              project_name=$(echo "$project_name" | sed -E 's/^-+|-+$//g' | sed -E 's/--+/-/g')
+
+              if [ -z "$project_name" ]; then
+                echo "Skipping project '$project_name_raw' as its sanitized name is empty or invalid for OCI artifacts."
+                continue # Skip to the next project
+              fi
+              # ----------------------------------------------------
+
+              zip_file_name="${project_name_raw}.zip"      # Keep original name for the zip file itself
               zip_file_path="${ZIP_OUTPUT_DIR}/${zip_file_name}" # Full path for the zip file
 
-              echo "--- Processing project: $project_name ---"
+              echo "--- Processing project: $project_name_raw (sanitized OCI name: $project_name) ---"
               echo "Zipping contents of '$project_path' into '$zip_file_path'..."
 
               # Change directory to the project path, then zip its contents.
               # This ensures the zip file contains the project's files at its root.
               (cd "$project_path" && zip -q -r "$GITHUB_WORKSPACE/$zip_file_path" .)
 
-              echo "Publishing '$zip_file_name' to GitHub Packages..."
-              # Define the package name in ghcr.io
-              # Format: ghcr.io/<owner>/<repo>/<project_name>:<tag_name>
+              echo "Publishing '$zip_file_name' to GitHub Packages... (as $project_name)"
+              # Define the package name in ghcr.io using the sanitized project_name
+              # Format: ghcr.io/<owner>/<repo>/<sanitized_project_name>:<tag_name>
               PACKAGE_REF="ghcr.io/${{ github.repository }}/${project_name}:${TAG_NAME}"
 
               # Use ORAS to push the zip file as an OCI artifact
-              # --config /dev/null: No config file needed for a simple blob
-              # "$zip_file_name:application/zip": The file to push, and its media type
               oras push "$PACKAGE_REF" --config /dev/null "$zip_file_path:application/zip"
 
               echo "Successfully published '$zip_file_name' as '$PACKAGE_REF'."
