@@ -1,0 +1,83 @@
+name: Publish Project Zips to GitHub Packages
+
+on:
+  push:
+    tags:
+      - 'v*.*.*' # Trigger on pushes to tags like v1.0.0, v1.0.0-beta, etc.
+
+permissions:
+  contents: read # Required to checkout code
+  packages: write # Required to publish packages to GitHub Packages
+
+jobs:
+  publish-project-zips:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install zip utility
+        run: sudo apt-get update && sudo apt-get install -y zip
+
+      - name: Install ORAS CLI
+        # ORAS (OCI Registry As Storage) is a CLI tool to interact with OCI registries
+        # It's ideal for pushing arbitrary artifacts (like zips) to ghcr.io
+        uses: oras-project/setup-oras@v1
+        with:
+          version: 1.0.0 # Use a specific version for stability
+
+      - name: Log in to GitHub Container Registry (ghcr.io)
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Create and Publish Zips for each project
+        env:
+          # GITHUB_TOKEN is a secret token automatically provided by GitHub Actions
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # The tag name (e.g., v1.0.0)
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          PROJECTS_DIR="./projects"
+          ZIP_OUTPUT_DIR="./temp_zips" # Temporary directory to store zips before upload
+
+          # Check if the projects directory exists
+          if [ ! -d "$PROJECTS_DIR" ]; then
+            echo "Directory '$PROJECTS_DIR' not found. Skipping zip creation."
+            exit 0 # Exit gracefully if no projects directory
+          fi
+
+          # Create the temporary output directory for zips
+          mkdir -p "$ZIP_OUTPUT_DIR"
+
+          echo "Searching for projects in: $PROJECTS_DIR"
+
+          # Loop through each subdirectory in the projects directory
+          for project_path in "$PROJECTS_DIR"/*/; do
+            if [ -d "$project_path" ]; then
+              project_name=$(basename "$project_path") # Get the name of the project directory
+              zip_file_name="${project_name}.zip"      # Define the name for the zip file
+              zip_file_path="${ZIP_OUTPUT_DIR}/${zip_file_name}" # Full path for the zip file
+
+              echo "--- Processing project: $project_name ---"
+              echo "Zipping contents of '$project_path' into '$zip_file_path'..."
+
+              # Change directory to the project path, then zip its contents.
+              # This ensures the zip file contains the project's files at its root.
+              (cd "$project_path" && zip -q -r "$GITHUB_WORKSPACE/$zip_file_path" .)
+
+              echo "Publishing '$zip_file_name' to GitHub Packages..."
+              # Define the package name in ghcr.io
+              # Format: ghcr.io/<owner>/<repo>/<project_name>:<tag_name>
+              PACKAGE_REF="ghcr.io/${{ github.repository }}/${project_name}:${TAG_NAME}"
+
+              # Use ORAS to push the zip file as an OCI artifact
+              # --config /dev/null: No config file needed for a simple blob
+              # "$zip_file_name:application/zip": The file to push, and its media type
+              oras push "$PACKAGE_REF" --config /dev/null "$zip_file_path:application/zip"
+
+              echo "Successfully published '$zip_file_name' as '$PACKAGE_REF'."
+              echo "-------------------------------------"
+            fi
+          done
+
+          echo "All project zips processed."
