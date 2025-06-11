@@ -1,4 +1,4 @@
-name: Publish Project Zips to GitHub Packages
+name: Publish Project Zips to GitHub Packages & Release Assets
 
 on:
   push:
@@ -6,12 +6,16 @@ on:
       - 'v*.*.*' # Trigger on pushes to tags like v1.0.0, v1.0.0-beta, etc.
 
 permissions:
-  contents: read # Required to checkout code
-  packages: write # Required to publish packages to GitHub Packages
+  contents: write # Required for creating releases and uploading assets
+  packages: write # Required for publishing packages
 
 jobs:
-  publish-project-zips:
+  # 1. Job to create all project zip files and upload them as an artifact
+  create-project-zips:
+    name: Create Project Zips
     runs-on: ubuntu-latest
+    permissions:
+      contents: read # Only read permission needed for this job
 
     steps:
       - name: Checkout code
@@ -20,76 +24,216 @@ jobs:
       - name: Install zip utility
         run: sudo apt-get update && sudo apt-get install -y zip
 
-      - name: Install ORAS CLI
-        # ORAS (OCI Registry As Storage) is a CLI tool to interact with OCI registries
-        # It's ideal for pushing arbitrary artifacts (like zips) to ghcr.io
-        uses: oras-project/setup-oras@v1 # <--- CHANGED THIS LINE
+      - name: Create Zips for each project
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }} # Pass workspace path to script
+        run: |
+          PROJECTS_DIR="./projects"
+          ZIP_OUTPUT_DIR="./temp_zips" # Temporary directory to store zips
+
+          if [ ! -d "$PROJECTS_DIR" ]; then
+            echo "Directory '$PROJECTS_DIR' not found. Skipping zip creation."
+            exit 0
+          fi
+
+          mkdir -p "$ZIP_OUTPUT_DIR"
+          echo "Searching for projects in: $PROJECTS_DIR"
+
+          for project_path in "$PROJECTS_DIR"/*/; do
+            if [ -d "$project_path" ]; then
+              project_name_raw=$(basename "$project_path")
+              zip_file_name="${project_name_raw}.zip"
+              zip_file_path="${ZIP_OUTPUT_DIR}/${zip_file_name}"
+
+              echo "--- Processing project: $project_name_raw ---"
+              echo "Zipping contents of '$project_path' into '$zip_file_path'..."
+              (cd "$project_path" && zip -q -r "$GITHUB_WORKSPACE/$zip_file_path" .)
+              echo "Successfully created '$zip_file_name'."
+              echo "-------------------------------------"
+            fi
+          done
+          echo "All project zips created."
+
+      - name: Upload Zips as Artifact
+        uses: actions/upload-artifact@v4
         with:
-          version: 1.0.0 # Use a specific version for stability
+          name: project-zips # Name of the artifact
+          path: ./temp_zips # Path to the directory containing the zips
+          retention-days: 1 # Optional: How long to keep the artifact (e.g., 1 day)
 
-      - name: Log in to GitHub Container Registry (ghcr.io)
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+  # 2. Job to create the GitHub Release and get its details
+  create-github-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: create-project-zips # Ensure zips are created before attempting to create a release for them
+    permissions:
+      contents: write # Required to create a release
+    outputs:
+      release_id: ${{ steps.get_or_create_release.outputs.release_id }}
+      upload_url: ${{ steps.get_or_create_release.outputs.upload_url }}
 
-      - name: Create and Publish Zips for each project
+    steps:
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Get or Create Release
+        id: get_or_create_release # ID for this step to reference its outputs
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG_NAME: ${{ github.ref_name }}
         run: |
-          PROJECTS_DIR="./projects"
-          ZIP_OUTPUT_DIR="./temp_zips" # Temporary directory to store zips before upload
+          echo "Checking for existing release for tag: $TAG_NAME"
+          RELEASE_INFO=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+                               -H "Accept: application/vnd.github.v3+json" \
+                               "https://api.github.com/repos/${{ github.repository }}/releases/tags/$TAG_NAME")
+          
+          RELEASE_ID=$(echo "$RELEASE_INFO" | jq -r '.id')
+          UPLOAD_URL=$(echo "$RELEASE_INFO" | jq -r '.upload_url')
 
-          # Check if the projects directory exists
-          if [ ! -d "$PROJECTS_DIR" ]; then
-            echo "Directory '$PROJECTS_DIR' not found. Skipping zip creation."
-            exit 0 # Exit gracefully if no projects directory
+          if [ "$RELEASE_ID" = "null" ]; then
+            echo "No existing release found for tag '$TAG_NAME'. Creating a new one..."
+            RELEASE_RESPONSE=$(curl -s -X POST -H "Authorization: token $GITHUB_TOKEN" \
+                                    -H "Accept: application/vnd.github.v3+json" \
+                                    -d "{\"tag_name\":\"$TAG_NAME\",\"name\":\"Release $TAG_NAME\",\"body\":\"Automated release for tag $TAG_NAME\",\"draft\":false,\"prerelease\":false}" \
+                                    "https://api.github.com/repos/${{ github.repository }}/releases")
+            RELEASE_ID=$(echo "$RELEASE_RESPONSE" | jq -r '.id')
+            UPLOAD_URL=$(echo "$RELEASE_RESPONSE" | jq -r '.upload_url')
+            echo "Created release with ID: $RELEASE_ID"
+          else
+            echo "Found existing release with ID: $RELEASE_ID"
           fi
 
-          # Create the temporary output directory for zips
-          mkdir -p "$ZIP_OUTPUT_DIR"
+          if [ "$UPLOAD_URL" = "null" ]; then
+            echo "Error: Could not determine upload URL for release."
+            exit 1
+          fi
 
-          echo "Searching for projects in: $PROJECTS_DIR"
+          echo "Upload URL: $UPLOAD_URL"
+          
+          # Set outputs for subsequent jobs
+          echo "release_id=$RELEASE_ID" >> "$GITHUB_OUTPUT"
+          echo "upload_url=$UPLOAD_URL" >> "$GITHUB_OUTPUT"
 
-          # Loop through each subdirectory in the projects directory
-          for project_path in "$PROJECTS_DIR"/*/; do
-            if [ -d "$project_path" ]; then
-              project_name_raw=$(basename "$project_path") # Get the original name of the project directory
+  # 3a. Parallel Job: Upload zips as Release Assets
+  upload-release-assets:
+    name: Upload Release Assets
+    runs-on: ubuntu-latest
+    needs: [create-project-zips, create-github-release] # Depends on both zips and release info
+    permissions:
+      contents: write # Required to upload release assets
+
+    steps:
+      - name: Download Zips Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: project-zips
+          path: ./downloaded_zips
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Upload Zips to Release Assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ needs.create-github-release.outputs.release_id }}
+          UPLOAD_URL: ${{ needs.create-github-release.outputs.upload_url }}
+        run: |
+          ZIP_INPUT_DIR="./downloaded_zips"
+
+          if [ ! -d "$ZIP_INPUT_DIR" ] || [ -z "$(ls -A "$ZIP_INPUT_DIR"/*.zip 2>/dev/null)" ]; then
+            echo "No zip files found in '$ZIP_INPUT_DIR'. Skipping upload to release assets."
+            exit 0
+          fi
+
+          echo "Fetching existing assets for release ID: $RELEASE_ID"
+          EXISTING_ASSETS_JSON=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+                                       -H "Accept: application/vnd.github.v3+json" \
+                                       "https://api.github.com/repos/${{ github.repository }}/releases/$RELEASE_ID/assets")
+          EXISTING_ASSET_NAMES=$(echo "$EXISTING_ASSETS_JSON" | jq -r '.[].name' | tr '\n' ' ')
+          echo "Existing assets in release: $EXISTING_ASSET_NAMES"
+
+          for zip_file_path in "$ZIP_INPUT_DIR"/*.zip; do
+            if [ -f "$zip_file_path" ]; then
+              zip_file_name=$(basename "$zip_file_path")
+
+              echo "--- Processing asset: $zip_file_name ---"
+              if echo "$EXISTING_ASSET_NAMES" | grep -q "$zip_file_name"; then
+                echo "Asset '$zip_file_name' already exists in release. Skipping upload."
+                echo "-------------------------------------"
+                continue
+              fi
+
+              echo "Uploading '$zip_file_name' to release assets..."
+              curl -X POST -H "Authorization: token $GITHUB_TOKEN" \
+                   -H "Content-Type: application/zip" \
+                   --data-binary "@$zip_file_path" \
+                   "$(echo "$UPLOAD_URL" | sed 's/{?name,label}//')?name=$zip_file_name"
+
+              echo "Successfully uploaded '$zip_file_name'."
+              echo "-------------------------------------"
+            fi
+          done
+          echo "All project zips processed for release assets."
+
+  # 3b. Parallel Job: Upload zips as GitHub Packages (OCI artifacts)
+  upload-packages:
+    name: Upload GitHub Packages
+    runs-on: ubuntu-latest
+    needs: create-project-zips # Only needs the zips artifact
+    permissions:
+      packages: write # Required to publish packages
+
+    steps:
+      - name: Download Zips Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: project-zips
+          path: ./downloaded_zips
+
+      - name: Install ORAS CLI
+        uses: oras-project/setup-oras@v1
+        with:
+          version: 1.0.0
+
+      - name: Log in to GitHub Container Registry (ghcr.io)
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Publish Zips to GitHub Packages
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          ZIP_INPUT_DIR="./downloaded_zips"
+
+          if [ ! -d "$ZIP_INPUT_DIR" ] || [ -z "$(ls -A "$ZIP_INPUT_DIR"/*.zip 2>/dev/null)" ]; then
+            echo "No zip files found in '$ZIP_INPUT_DIR'. Skipping upload to GitHub Packages."
+            exit 0
+          fi
+
+          echo "Publishing zips from: $ZIP_INPUT_DIR"
+
+          for zip_file_path in "$ZIP_INPUT_DIR"/*.zip; do
+            if [ -f "$zip_file_path" ]; then
+              zip_file_name=$(basename "$zip_file_path")
+              project_name_raw="${zip_file_name%.zip}"
 
               # --- SANITIZE PROJECT NAME FOR OCI ARTIFACT NAMING ---
-              # 1. Convert to lowercase
-              # 2. Replace spaces/underscores with hyphens
-              # 3. Remove any characters that are not alphanumeric or hyphens
-              # 4. Remove leading/trailing hyphens
-              # 5. Collapse multiple hyphens into a single hyphen
               project_name=$(echo "$project_name_raw" | tr '[:upper:]' '[:lower:]' | sed 's/[ _]/-/g' | sed 's/[^a-z0-9-]//g')
               project_name=$(echo "$project_name" | sed -E 's/^-+|-+$//g' | sed -E 's/--+/-/g')
 
               if [ -z "$project_name" ]; then
-                echo "Skipping project '$project_name_raw' as its sanitized name is empty or invalid for OCI artifacts."
-                continue # Skip to the next project
+                echo "Skipping '$zip_file_name' as its sanitized name is empty or invalid for OCI artifacts."
+                continue
               fi
               # ----------------------------------------------------
 
-              zip_file_name="${project_name_raw}.zip"      # Keep original name for the zip file itself
-              zip_file_path="${ZIP_OUTPUT_DIR}/${zip_file_name}" # Full path for the zip file
-
-              echo "--- Processing project: $project_name_raw (sanitized OCI name: $project_name) ---"
-              echo "Zipping contents of '$project_path' into '$zip_file_path'..."
-
-              # Change directory to the project path, then zip its contents.
-              # This ensures the zip file contains the project's files at its root.
-              (cd "$project_path" && zip -q -r "$GITHUB_WORKSPACE/$zip_file_path" .)
-
-              echo "Publishing '$zip_file_name' to GitHub Packages... (as $project_name)"
-              # Define the package name in ghcr.io using the sanitized project_name
-              # Format: ghcr.io/<owner>/<repo>/<sanitized_project_name>:<tag_name>
+              echo "--- Publishing '$zip_file_name' (sanitized OCI name: $project_name) ---"
               PACKAGE_REF="ghcr.io/${{ github.repository }}/${project_name}:${TAG_NAME}"
 
-              # Use ORAS to push the zip file as an OCI artifact
               oras push "$PACKAGE_REF" --config /dev/null "$zip_file_path:application/zip"
 
               echo "Successfully published '$zip_file_name' as '$PACKAGE_REF'."
               echo "-------------------------------------"
             fi
           done
-
-          echo "All project zips processed."
+          echo "All project zips published to GitHub Packages."
