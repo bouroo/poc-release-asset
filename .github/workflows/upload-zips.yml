@@ -1,0 +1,75 @@
+name: Upload Project Zips to Release
+
+on:
+  release:
+    types: [published] # This workflow runs when a new release is published
+
+permissions:
+  contents: write # Required to upload release assets
+
+jobs:
+  upload-project-zips:
+    runs-on: ubuntu-latest # Use an Ubuntu runner
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4 # Checkout your repository code
+
+      - name: Install zip utility
+        run: sudo apt-get update && sudo apt-get install -y zip # Ensure zip is installed on the runner
+
+      - name: Create and Upload Zips for each project
+        env:
+          # The upload_url is provided by the release event payload
+          UPLOAD_URL: ${{ github.event.release.upload_url }}
+          # GITHUB_TOKEN is a secret token automatically provided by GitHub Actions
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PROJECTS_DIR="./projects"
+          ZIP_OUTPUT_DIR="./release_zips" # Temporary directory to store zips before upload
+
+          # Check if the projects directory exists
+          if [ ! -d "$PROJECTS_DIR" ]; then
+            echo "Directory '$PROJECTS_DIR' not found. Skipping zip creation."
+            exit 0 # Exit gracefully if no projects directory
+          fi
+
+          # Create the temporary output directory for zips
+          mkdir -p "$ZIP_OUTPUT_DIR"
+
+          echo "Searching for projects in: $PROJECTS_DIR"
+
+          # Loop through each subdirectory in the projects directory
+          # The '*/' ensures we only iterate over directories
+          for project_path in "$PROJECTS_DIR"/*/; do
+            # Check if it's actually a directory (important for cases like empty projects dir or files)
+            if [ -d "$project_path" ]; then
+              project_name=$(basename "$project_path") # Get the name of the project directory
+              zip_file_name="${project_name}.zip"      # Define the name for the zip file
+              zip_file_path="${ZIP_OUTPUT_DIR}/${zip_file_name}" # Full path for the zip file
+
+              echo "--- Processing project: $project_name ---"
+              echo "Zipping contents of '$project_path' into '$zip_file_path'..."
+
+              # Change directory to the project path, then zip its contents.
+              # This ensures the zip file contains the project's files at its root,
+              # rather than nested under a 'projects/project_name' path.
+              # -q: quiet operation (no verbose output)
+              # -r: recurse into directories
+              # .: zip the current directory's contents
+              (cd "$project_path" && zip -q -r "$GITHUB_WORKSPACE/$zip_file_path" .)
+
+              echo "Uploading '$zip_file_name' to release assets..."
+              # Use curl to upload the asset.
+              # The UPLOAD_URL contains a template {?name,label} which needs to be replaced.
+              curl -X POST -H "Authorization: token $GITHUB_TOKEN" \
+                   -H "Content-Type: application/zip" \
+                   --data-binary "@$zip_file_path" \
+                   "$UPLOAD_URL?name=$zip_file_name"
+
+              echo "Successfully uploaded '$zip_file_name'."
+              echo "-------------------------------------"
+            fi
+          done
+
+          echo "All project zips processed."
